@@ -53,10 +53,10 @@ module axi2mem #(
     } ax_req_t;
 
     // Registers
-    enum logic [2:0] { IDLE, READ, WRITE, SEND_B, WAIT_WVALID }  state_d, state_q;
-    ax_req_t                   ax_req_d, ax_req_q;
+    enum logic [1:0] { IDLE, READ, WRITE, SEND_B }  state_d, state_q;
+    ax_req_t                   ax_req_r_d, ax_req_r_q,ax_req_w_d, ax_req_w_q;
     logic [AXI_ADDR_WIDTH-1:0] req_addr_d, req_addr_q;
-    logic [7:0]                cnt_d, cnt_q;
+    logic [8:0]                cnt_d, cnt_q;
 
     function automatic logic [AXI_ADDR_WIDTH-1:0] get_wrap_boundary (input logic [AXI_ADDR_WIDTH-1:0] unaligned_address, input logic [7:0] len);
         logic [AXI_ADDR_WIDTH-1:0] warp_address = '0;
@@ -73,24 +73,34 @@ module axi2mem #(
         return warp_address;
     endfunction
 
-    logic [AXI_ADDR_WIDTH-1:0] aligned_address;
-    logic [AXI_ADDR_WIDTH-1:0] wrap_boundary;
-    logic [AXI_ADDR_WIDTH-1:0] upper_wrap_boundary;
-    logic [AXI_ADDR_WIDTH-1:0] cons_addr;
+    logic [AXI_ADDR_WIDTH-1:0] aligned_address_r,aligned_address_w;
+    logic [AXI_ADDR_WIDTH-1:0] wrap_boundary_r,wrap_boundary_w;
+    logic [AXI_ADDR_WIDTH-1:0] upper_wrap_boundary_r,upper_wrap_boundary_w;
+    logic [AXI_ADDR_WIDTH-1:0] cons_addr_r,cons_addr_w;
+    logic write_pending_q, write_pending_d;
 
     always_comb begin
         // address generation
-        aligned_address = {ax_req_q.addr[AXI_ADDR_WIDTH-1:LOG_NR_BYTES], {{LOG_NR_BYTES}{1'b0}}};
-        wrap_boundary = get_wrap_boundary(ax_req_q.addr, ax_req_q.len);
+        aligned_address_r = {ax_req_r_q.addr[AXI_ADDR_WIDTH-1:LOG_NR_BYTES], {{LOG_NR_BYTES}{1'b0}}};
+        wrap_boundary_r = get_wrap_boundary(ax_req_r_q.addr, ax_req_r_q.len);
         // this will overflow
-        upper_wrap_boundary = wrap_boundary + ((ax_req_q.len + 1) << LOG_NR_BYTES);
+        upper_wrap_boundary_r = wrap_boundary_r + ((ax_req_r_q.len + 1) << LOG_NR_BYTES);
         // calculate consecutive address
-        cons_addr = aligned_address + (cnt_q << LOG_NR_BYTES);
+        cons_addr_r = aligned_address_r + (cnt_q << LOG_NR_BYTES);
+
+        // address generation
+        aligned_address_w = {ax_req_w_q.addr[AXI_ADDR_WIDTH-1:LOG_NR_BYTES], {{LOG_NR_BYTES}{1'b0}}};
+        wrap_boundary_w = get_wrap_boundary(ax_req_w_q.addr, ax_req_w_q.len);
+        // this will overflow
+        upper_wrap_boundary_w = wrap_boundary_w + ((ax_req_w_q.len + 1) << LOG_NR_BYTES);
+        // calculate consecutive address
+        cons_addr_w = aligned_address_w + (cnt_q << LOG_NR_BYTES);
 
         // Transaction attributes
         // default assignments
         state_d    = state_q;
-        ax_req_d   = ax_req_q;
+        ax_req_r_d   = ax_req_r_q;
+        ax_req_w_d   = ax_req_w_q;
         req_addr_d = req_addr_q;
         cnt_d      = cnt_q;
         // Memory default assignments
@@ -109,7 +119,7 @@ module axi2mem #(
         slave.r_data   = data_i;
         slave.r_resp   = '0;
         slave.r_last   = '0;
-        slave.r_id     = ax_req_q.id;
+        slave.r_id     = ax_req_r_q.id;
         slave.r_user   = user_i;
         // slave write data channel
         slave.w_ready  = 1'b0;
@@ -119,6 +129,8 @@ module axi2mem #(
         slave.b_id     = 1'b0;
         slave.b_user   = 1'b0;
 
+        write_pending_d = write_pending_q;
+
         case (state_q)
 
             IDLE: begin
@@ -126,10 +138,10 @@ module axi2mem #(
                 // ------------
                 // Read
                 // ------------
-                if (slave.ar_valid) begin
+                if (slave.ar_valid && !(write_pending_d && slave.w_valid)) begin
                     slave.ar_ready = 1'b1;
                     // sample ax
-                    ax_req_d       = {slave.ar_id, slave.ar_addr, slave.ar_len, slave.ar_size, slave.ar_burst};
+                    ax_req_r_d       = {slave.ar_id, slave.ar_addr, slave.ar_len, slave.ar_size, slave.ar_burst};
                     state_d        = READ;
                     //  we can request the first address, this saves us time
                     req_o          = 1'b1;
@@ -141,36 +153,49 @@ module axi2mem #(
                 // ------------
                 // Write
                 // ------------
-                end else if (slave.aw_valid) begin
-                    slave.aw_ready = 1'b1;
-                    slave.w_ready  = 1'b1;
-                    addr_o         = slave.aw_addr;
-                    // sample ax
-                    ax_req_d       = {slave.aw_id, slave.aw_addr, slave.aw_len, slave.aw_size, slave.aw_burst};
-                    // we've got our first w_valid so start the write process
+                end else if (slave.aw_valid && !write_pending_d) begin
+                        slave.aw_ready = 1'b1;
+                        slave.w_ready  = 1'b1;
+                        addr_o         = slave.aw_addr;
+                        // sample ax
+                        ax_req_w_d       = {slave.aw_id, slave.aw_addr, slave.aw_len, slave.aw_size, slave.aw_burst};
+                        // we've got our first w_valid so start the write process
+                        if (slave.w_valid) begin
+                            req_o          = 1'b1;
+                            we_o           = 1'b1;
+                            state_d        = (slave.w_last) ? SEND_B : WRITE;
+                            cnt_d          = 1;
+                        // we still have to wait for the first w_valid to arrive
+                        end else
+                            // state_d = WAIT_WVALID;
+                            write_pending_d = 1'b1;
+                    end 
+                
+                if(write_pending_d) begin
+                    slave.w_ready = 1'b1;
+                    addr_o = ax_req_w_q.addr;
+                    // we can now make our first request
                     if (slave.w_valid) begin
                         req_o          = 1'b1;
                         we_o           = 1'b1;
                         state_d        = (slave.w_last) ? SEND_B : WRITE;
                         cnt_d          = 1;
-                    // we still have to wait for the first w_valid to arrive
-                    end else
-                        state_d = WAIT_WVALID;
+                        write_pending_d = 1'b0;
+                    end
                 end
             end
-
             // ~> we are still missing a w_valid
-            WAIT_WVALID: begin
-                slave.w_ready = 1'b1;
-                addr_o = ax_req_q.addr;
-                // we can now make our first request
-                if (slave.w_valid) begin
-                    req_o          = 1'b1;
-                    we_o           = 1'b1;
-                    state_d        = (slave.w_last) ? SEND_B : WRITE;
-                    cnt_d          = 1;
-                end
-            end
+            // WAIT_WVALID: begin
+            //     slave.w_ready = 1'b1;
+            //     addr_o = ax_req_q.addr;
+            //     // we can now make our first request
+            //     if (slave.w_valid) begin
+            //         req_o          = 1'b1;
+            //         we_o           = 1'b1;
+            //         state_d        = (slave.w_last) ? SEND_B : WRITE;
+            //         cnt_d          = 1;
+            //     end
+            // end
 
             READ: begin
                 // keep request to memory high
@@ -180,8 +205,8 @@ module axi2mem #(
                 slave.r_valid = 1'b1;
                 slave.r_data  = data_i;
                 slave.r_user  = user_i;
-                slave.r_id    = ax_req_q.id;
-                slave.r_last  = (cnt_q == ax_req_q.len + 1);
+                slave.r_id    = ax_req_r_q.id;
+                slave.r_last  = (cnt_q == ax_req_r_q.len + 1);
 
                 // check that the master is ready, the slave must not wait on this
                 if (slave.r_ready) begin
@@ -189,18 +214,18 @@ module axi2mem #(
                     // Next address generation
                     // ----------------------------
                     // handle the correct burst type
-                    case (ax_req_q.burst)
-                        FIXED, INCR: addr_o = cons_addr;
+                    case (ax_req_r_q.burst)
+                        FIXED, INCR: addr_o = cons_addr_r;
                         WRAP:  begin
                             // check if the address reached warp boundary
-                            if (cons_addr == upper_wrap_boundary) begin
-                                addr_o = wrap_boundary;
+                            if (cons_addr_r == upper_wrap_boundary_r) begin
+                                addr_o = wrap_boundary_r;
                             // address warped beyond boundary
-                            end else if (cons_addr > upper_wrap_boundary) begin
-                                addr_o = ax_req_q.addr + ((cnt_q - ax_req_q.len) << LOG_NR_BYTES);
+                            end else if (cons_addr_r > upper_wrap_boundary_r) begin
+                                addr_o = ax_req_r_q.addr + ((cnt_q - ax_req_r_q.len) << LOG_NR_BYTES);
                             // we are still in the incremental regime
                             end else begin
-                                addr_o = cons_addr;
+                                addr_o = cons_addr_r;
                             end
                         end
                     endcase
@@ -231,19 +256,19 @@ module axi2mem #(
                     // Next address generation
                     // ----------------------------
                     // handle the correct burst type
-                    case (ax_req_q.burst)
+                    case (ax_req_w_q.burst)
 
-                        FIXED, INCR: addr_o = cons_addr;
+                        FIXED, INCR: addr_o = cons_addr_w;
                         WRAP:  begin
                             // check if the address reached warp boundary
-                            if (cons_addr == upper_wrap_boundary) begin
-                                addr_o = wrap_boundary;
+                            if (cons_addr_w == upper_wrap_boundary_w) begin
+                                addr_o = wrap_boundary_w;
                             // address warped beyond boundary
-                            end else if (cons_addr > upper_wrap_boundary) begin
-                                addr_o = ax_req_q.addr + ((cnt_q - ax_req_q.len) << LOG_NR_BYTES);
+                            end else if (cons_addr_w > upper_wrap_boundary_w) begin
+                                addr_o = ax_req_w_q.addr + ((cnt_q - ax_req_w_q.len) << LOG_NR_BYTES);
                             // we are still in the incremental regime
                             end else begin
-                                addr_o = cons_addr;
+                                addr_o = cons_addr_w;
                             end
                         end
                     endcase
@@ -259,7 +284,7 @@ module axi2mem #(
             // ~> send a write acknowledge back
             SEND_B: begin
                 slave.b_valid = 1'b1;
-                slave.b_id    = ax_req_q.id;
+                slave.b_id    = ax_req_w_q.id;
                 if (slave.b_ready)
                     state_d = IDLE;
             end
@@ -286,14 +311,18 @@ module axi2mem #(
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (~rst_ni) begin
             state_q    <= IDLE;
-            ax_req_q  <= '0;
+            ax_req_r_q  <= '0;
+            ax_req_w_q  <= '0;
             req_addr_q <= '0;
             cnt_q      <= '0;
+            write_pending_q <= '0;
         end else begin
             state_q    <= state_d;
-            ax_req_q   <= ax_req_d;
+            ax_req_r_q   <= ax_req_r_d;
+            ax_req_w_q   <= ax_req_w_d;
             req_addr_q <= req_addr_d;
             cnt_q      <= cnt_d;
+            write_pending_q <= write_pending_d;
         end
     end
 endmodule
